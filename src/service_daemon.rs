@@ -2344,7 +2344,7 @@ impl Zeroconf {
 
     /// Sends a multicast query for `name` with `qtype`.
     fn send_query(&self, name: &str, qtype: RRType) {
-        self.send_query_vec(&[(name, qtype)]);
+        self.send_query_vec(&[(name, qtype)], true);
     }
 
     /// Sends a query on a specific interface without known answers.
@@ -2376,25 +2376,36 @@ impl Zeroconf {
     }
 
     /// Sends out a list of `questions` (i.e. DNS questions) via multicast.
-    fn send_query_vec(&self, questions: &[(&str, RRType)]) {
+    ///
+    /// When `include_known_answers` is true, cached answers are attached to the
+    /// query for Known-Answer Suppression (RFC 6762 §7.1, traffic reduction). It
+    /// MUST be false for an explicit/first browse query: a long-lived daemon that
+    /// has passively cached a Shared PTR with a long TTL would otherwise list it as
+    /// a known answer, making the responder suppress its reply — so the daemon never
+    /// resolves that service while a freshly-started daemon does. This mirrors the
+    /// new-interface antidote (`send_query_on_intf`; see keepsimple1/mdns-sd#450,
+    /// which did the same for the new-interface query path).
+    fn send_query_vec(&self, questions: &[(&str, RRType)], include_known_answers: bool) {
         let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
         let now = current_time_millis();
 
         for (name, qtype) in questions {
             out.add_question(name, *qtype);
 
-            for record in self.cache.get_known_answers(name, *qtype, now) {
-                /*
-                RFC 6762 section 7.1: https://datatracker.ietf.org/doc/html/rfc6762#section-7.1
-                ...
-                    When a Multicast DNS querier sends a query to which it already knows
-                    some answers, it populates the Answer Section of the DNS query
-                    message with those answers.
-                 */
-                trace!("add known answer: {:?}", record.record);
-                let mut new_record = record.record.clone();
-                new_record.get_record_mut().update_ttl(now);
-                out.add_answer_box(new_record);
+            if include_known_answers {
+                for record in self.cache.get_known_answers(name, *qtype, now) {
+                    /*
+                    RFC 6762 section 7.1: https://datatracker.ietf.org/doc/html/rfc6762#section-7.1
+                    ...
+                        When a Multicast DNS querier sends a query to which it already knows
+                        some answers, it populates the Answer Section of the DNS query
+                        message with those answers.
+                     */
+                    trace!("add known answer: {:?}", record.record);
+                    let mut new_record = record.record.clone();
+                    new_record.get_record_mut().update_ttl(now);
+                    out.add_answer_box(new_record);
+                }
             }
         }
 
@@ -2512,7 +2523,10 @@ impl Zeroconf {
             for record in records {
                 if let Some(srv) = record.record.any().downcast_ref::<DnsSrv>() {
                     if self.cache.get_addr(srv.host()).is_none() {
-                        self.send_query_vec(&[(srv.host(), RRType::A), (srv.host(), RRType::AAAA)]);
+                        self.send_query_vec(
+                            &[(srv.host(), RRType::A), (srv.host(), RRType::AAAA)],
+                            true,
+                        );
                         return true;
                     }
                 }
@@ -3552,7 +3566,14 @@ impl Zeroconf {
             return;
         }
 
-        self.send_query(&ty, RRType::PTR);
+        // The explicit/first browse query (`!repeating`) MUST NOT carry known
+        // answers: if we have passively cached the responder's Shared PTR (a
+        // long-lived daemon does), listing it makes the responder suppress its
+        // reply and the service never resolves — while a freshly-started daemon
+        // (empty cache) resolves fine. Periodic refreshes keep known-answer
+        // suppression for RFC 6762 §7.1 traffic reduction. (Generalizes the
+        // new-interface antidote; see keepsimple1/mdns-sd#450.)
+        self.send_query_vec(&[(ty.as_str(), RRType::PTR)], repeating);
         self.increase_counter(Counter::Browse, 1);
 
         let next_time = now + (next_delay * 1000) as u64;
@@ -3586,7 +3607,7 @@ impl Zeroconf {
             self.query_cache_for_hostname(&hostname, listener.clone());
         }
 
-        self.send_query_vec(&[(&hostname, RRType::A), (&hostname, RRType::AAAA)]);
+        self.send_query_vec(&[(&hostname, RRType::A), (&hostname, RRType::AAAA)], true);
         self.increase_counter(Counter::ResolveHostname, 1);
 
         let now = current_time_millis();
@@ -3836,7 +3857,7 @@ impl Zeroconf {
                 .iter()
                 .map(|(record, rr_type)| (record.as_str(), *rr_type))
                 .collect();
-            self.send_query_vec(&query_vec);
+            self.send_query_vec(&query_vec, true);
 
             if let Some(new_expire) = expire_at {
                 self.add_timer(new_expire); // ensure a check for the new expire time.
@@ -3870,14 +3891,14 @@ impl Zeroconf {
                     .into_iter()
                     .map(|ty| (instance.as_str(), ty))
                     .collect::<Vec<_>>();
-                self.send_query_vec(&query_vec);
+                self.send_query_vec(&query_vec, true);
                 query_srv_count += 1;
             }
             new_timers.extend(timers);
             let (hostnames, timers) = self.cache.refresh_due_hosts(ty_domain);
             for hostname in hostnames.iter() {
                 trace!("sending refresh queries for A and AAAA:  {}", hostname);
-                self.send_query_vec(&[(hostname, RRType::A), (hostname, RRType::AAAA)]);
+                self.send_query_vec(&[(hostname, RRType::A), (hostname, RRType::AAAA)], true);
                 query_addr_count += 2;
             }
             new_timers.extend(timers);
