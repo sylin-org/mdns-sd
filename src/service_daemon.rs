@@ -2456,35 +2456,59 @@ impl Zeroconf {
             }
         };
 
-        // Find the interface that received the packet.
+        // Resolve the interface that received the packet from the kernel's IP_PKTINFO
+        // index. When that index is NOT in `my_intfs`, do NOT drop the packet: that
+        // silently breaks ALL inbound mDNS whenever our interface snapshot (from
+        // `if-addrs`) disagrees with the kernel's `ipi_ifindex` — e.g. an index
+        // reported as 0/None, a transient enumeration, or a long-lived daemon whose
+        // snapshot has drifted — even though sending keeps working (the send path
+        // selects the egress interface by address, not by index). Instead, accept the
+        // packet with a best-effort `InterfaceId` that preserves the real kernel
+        // index, so parsing/caching proceed and downstream index checks stay
+        // consistent. Per-interface attribution is best-effort on this fallback path.
         let pkt_if_index = pktinfo.if_index as u32;
-        let Some(my_intf) = self.my_intfs.get(&pkt_if_index) else {
-            debug!(
-                "handle_read: no interface found for pktinfo if_index: {}",
-                pktinfo.if_index
-            );
-            return true; // We still return true to indicate that we read something.
+        let interface_id = match self.my_intfs.get(&pkt_if_index) {
+            Some(my_intf) => {
+                // Drop packets for an IP version that has been disabled on this
+                // interface. This is needed because sometimes the socket layer may
+                // still receive packets for an IP version even after we left the
+                // multicast group for it, and we want to avoid that processing. Only
+                // applied on an exact interface match (we trust its IP-version state).
+                let is_ipv4 = event_key == IPV4_SOCK_EVENT_KEY;
+                if (is_ipv4 && my_intf.next_ifaddr_v4().is_none())
+                    || (!is_ipv4 && my_intf.next_ifaddr_v6().is_none())
+                {
+                    debug!(
+                        "handle_read: dropping {} packet on intf {} (disabled)",
+                        if is_ipv4 { "IPv4" } else { "IPv6" },
+                        my_intf.name
+                    );
+                    return true;
+                }
+                InterfaceId::from(my_intf)
+            }
+            None => {
+                debug!(
+                    "handle_read: pktinfo if_index {} not in my_intfs; accepting with \
+                     a best-effort interface id instead of dropping",
+                    pktinfo.if_index
+                );
+                let name = self
+                    .my_intfs
+                    .values()
+                    .next()
+                    .map(|intf| intf.name.clone())
+                    .unwrap_or_default();
+                InterfaceId {
+                    name,
+                    index: pkt_if_index,
+                }
+            }
         };
-
-        // Drop packets for an IP version that has been disabled on this interface.
-        // This is needed because some times the socket layer may still receive packets
-        // for an IP version even after we left the multicast group for that IP version.
-        // We want to drop such packets to avoid unnecessary processing.
-        let is_ipv4 = event_key == IPV4_SOCK_EVENT_KEY;
-        if (is_ipv4 && my_intf.next_ifaddr_v4().is_none())
-            || (!is_ipv4 && my_intf.next_ifaddr_v6().is_none())
-        {
-            debug!(
-                "handle_read: dropping {} packet on intf {} (disabled)",
-                if is_ipv4 { "IPv4" } else { "IPv6" },
-                my_intf.name
-            );
-            return true;
-        }
 
         buf.truncate(sz); // reduce potential processing errors
 
-        match DnsIncoming::new(buf, my_intf.into()) {
+        match DnsIncoming::new(buf, interface_id) {
             Ok(msg) => {
                 if msg.is_query() {
                     let querier_addr = pktinfo.addr_src;
