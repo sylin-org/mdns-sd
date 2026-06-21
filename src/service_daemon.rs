@@ -2467,6 +2467,16 @@ impl Zeroconf {
         // index, so parsing/caching proceed and downstream index checks stay
         // consistent. Per-interface attribution is best-effort on this fallback path.
         let pkt_if_index = pktinfo.if_index as u32;
+        // KOIDBG: temporary receive diagnostic (remove before finalizing).
+        eprintln!(
+            "KOIDBG handle_read token={} src={} if_index={} matched={} my_intfs_keys={:?} sz={}",
+            event_key,
+            pktinfo.addr_src,
+            pkt_if_index,
+            self.my_intfs.contains_key(&pkt_if_index),
+            self.my_intfs.keys().collect::<Vec<_>>(),
+            sz
+        );
         let interface_id = match self.my_intfs.get(&pkt_if_index) {
             Some(my_intf) => {
                 // Drop packets for an IP version that has been disabled on this
